@@ -197,6 +197,11 @@ class ChatClient:
 
         except Exception as e:
             self.logger.fault(f"Connection to {server_ip} failed: {e}")
+            try:
+                self.server_socket.close()
+            except Exception:
+                pass
+            self.server_socket = None
             if not self.server_ip:
                 threading.Thread(target=self._discover_and_connect, daemon=True).start()
 
