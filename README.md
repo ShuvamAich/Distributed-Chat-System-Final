@@ -1,12 +1,12 @@
 # Distributed Real-Time Chat System
 
-A fully custom distributed chat system with no external dependencies. Implements dynamic discovery, leader election, causal ordering, reliable multicast, and fault tolerance — all with a custom middleware layer.
+A fully custom distributed chat system with no external dependencies. Implements dynamic discovery, leader election, Lamport clock ordering, reliable multicast, and fault tolerance — all with a custom middleware layer.
 
 ## Quick Start
 
-**Prerequisites:** Python 3.7+
+**Prerequisites:** Python 3.7+ (no pip install needed)
 
-**Windows Note:** Set `PYTHONIOENCODING=utf-8` for proper log display:
+**Windows:** Set encoding for proper log display:
 ```cmd
 set PYTHONIOENCODING=utf-8
 ```
@@ -16,59 +16,109 @@ set PYTHONIOENCODING=utf-8
 python test_local.py
 ```
 
-### Launch Demo (single machine, multiple terminals)
-```bash
-python demo.py
-```
-
-### Manual Launch (multi-machine)
+### Multi-Machine Demo (recommended)
 
 On each machine (same LAN):
 
 ```bash
-# Machine 1
-python run_server.py --id S1 --port 6001
+# Machine 1 — Server
+python run_server.py
 
-# Machine 2
-python run_server.py --id S2 --port 6002
+# Machine 2 — Server
+python run_server.py
 
-# Machine 3
-python run_server.py --id S3 --port 6003
+# Machine 3 — Server
+python run_server.py
 
-# Any machine — client
-python run_client.py --username Alice --port 8001
+# Any machine — Client
+python run_client.py --username Alice
+
+# Any machine — Client
+python run_client.py --username Bob
 ```
+
+Servers auto-discover each other via UDP broadcast. Clients auto-discover servers. No IPs needed — everything is automatic on a LAN.
+
+### Single-Machine Demo (loopback)
+
+```bash
+# Terminal 1
+python run_server.py --ip 127.0.0.1
+
+# Terminal 2
+python run_server.py --ip 127.0.0.2
+
+# Terminal 3
+python run_server.py --ip 127.0.0.3
+
+# Terminal 4
+python run_client.py --username Alice --server 127.0.0.1
+
+# Terminal 5
+python run_client.py --username Bob --server 127.0.0.2
+```
+
+### Server Arguments
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--ip` | Server IP to bind to | Auto-detect LAN IP |
+| `--port` | TCP port for client connections | 10004 |
+
+### Client Arguments
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--username` / `-u` | Chat display name | User-{PID} |
+| `--server` / `-s` | Server IP (skip auto-discovery) | Auto-discover via broadcast |
+
+### Commands
+
+**Server:** `status` (show cluster info), `quit` (shutdown)
+
+**Client:** `/status`, `/history`, `/quit`
 
 ## Architecture
 
-- **Hybrid:** Client-Server (clients to servers) + P2P (server ring)
-- **Discovery:** UDP Multicast (239.1.1.1:5007)
-- **Transport:** TCP with length-prefixed framing
-- **Election:** LCR (LeLann-Chang-Roberts) ring algorithm
-- **Ordering:** Causal (vector clocks) + Total (leader sequencer)
-- **Reliability:** ACK/NACK with retransmission
-- **Fault Tolerance:** Heartbeat-based failure detection + re-election
+- **Hybrid:** Client-Server (TCP) + P2P Server Ring (UDP)
+- **Discovery:** UDP Broadcast (255.255.255.255:5972)
+- **Election:** LCR ring algorithm via UDP (port 10001)
+- **Ordering:** Lamport Timestamps + Total Ordering (leader sequencer)
+- **Reliability:** ACK/NACK with retransmission + client send buffer + server pending queue
+- **Fault Tolerance:** Heartbeat failure detection (30s timeout) + automatic re-election + gap recovery on reconnect
+
+## Key Features
+
+- **Zero configuration** — servers find each other automatically via broadcast
+- **No message loss** — client buffer + server queue + gap recovery guarantee delivery
+- **Leader failover** — automatic re-election within seconds, no manual intervention
+- **Implicit heartbeats** — active message traffic counts as liveness proof
+- **Demo-friendly** — rich colored terminal logs showing every system event with timestamps
 
 ## Documentation
 
-See [DOCUMENTATION.md](DOCUMENTATION.md) for the full technical documentation including:
-- Architecture diagrams
-- Algorithm explanations
+See [DOCUMENTATION.md](DOCUMENTATION.md) for full technical documentation:
+- System architecture diagrams
+- LCR election algorithm walkthrough
+- Lamport clock synchronization
+- Reliability mechanisms (4 layers)
+- Fault tolerance scenarios
 - Design rationale
-- Demo guide
 
 ## Project Structure
 
 ```
 distributed_chat/
-├── common/              # Shared utilities (message protocol, vector clocks, logger)
-├── middleware/          # Custom middleware (discovery, transport, election, ordering, reliability, group view, heartbeat)
+├── common/              # Lamport clock, network utils (form_ring, get_neighbour), logger
+├── middleware/          # Discovery, election (LCR), heartbeat, ordering, reliability, group view
 ├── server/             # Chat server node
 ├── client/             # Chat client
+├── Example Code/       # Reference patterns (broadcastsender, lcr-template, ring, lamport_clock, etc.)
 ├── demo.py             # Interactive demo launcher
-├── test_local.py       # Integration tests
+├── test_local.py       # Unit tests (5 tests)
 ├── run_server.py       # Quick server launch
 ├── run_client.py       # Quick client launch
 ├── DOCUMENTATION.md    # Full technical documentation
+├── FORM_ANSWERS.md     # Project report form answers
 └── README.md           # This file
 ```
