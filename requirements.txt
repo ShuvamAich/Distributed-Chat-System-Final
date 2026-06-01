@@ -1,0 +1,9 @@
+# No external dependencies required.
+# This project uses only Python standard library modules:
+# - socket (TCP/UDP networking)
+# - threading (concurrency)
+# - struct (message framing)
+# - json (serialization)
+# - time, uuid, os, sys, signal, argparse
+#
+# Python 3.7+ required.
