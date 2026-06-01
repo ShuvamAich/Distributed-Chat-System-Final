@@ -35,11 +35,12 @@ from common.lamport_clock import LamportClock
 class ChatClient:
     """Interactive chat client with automatic server discovery."""
 
-    def __init__(self, username=None, server_ip=None):
+    def __init__(self, username=None, server_ip=None, server_port=None):
         self.username = username or f"User-{os.getpid() % 1000}"
         self.my_ip = get_local_ip()
         self.logger = SystemLogger(self.my_ip, "CLIENT")
         self.server_ip = server_ip  # can be specified manually
+        self._server_port = server_port or TCP_PORT
         self.server_socket = None
         self.joined = False
         self.leader_ip = None
@@ -59,7 +60,7 @@ class ChatClient:
 
         if self.server_ip:
             # Connect directly to specified server
-            self._connect_to_server(self.server_ip)
+            self._connect_to_server(self.server_ip, self._server_port)
         else:
             # Discover server via broadcast
             self.logger.discovery("Listening for server broadcasts...")
@@ -151,11 +152,12 @@ class ChatClient:
                     msg = json.loads(data.decode())
                     if msg.get("type") == MSG_DISCOVERY_ANNOUNCE:
                         server_ip = msg.get("ip", addr[0])
+                        server_port = msg.get("tcp_port") or TCP_PORT
                         if server_ip != self.my_ip:
                             self.logger.discovery(
-                                f"Found server: {server_ip}")
+                                f"Found server: {server_ip}:{server_port}")
                             listen_socket.close()
-                            self._connect_to_server(server_ip)
+                            self._connect_to_server(server_ip, server_port)
                             return
             except socket.timeout:
                 self.logger.discovery("No server found yet, listening...")
@@ -167,16 +169,18 @@ class ChatClient:
 
         listen_socket.close()
 
-    def _connect_to_server(self, server_ip):
+    def _connect_to_server(self, server_ip, port=None):
         """Establish TCP connection to a server (like simpleclient.py)."""
+        port = port or TCP_PORT
         try:
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.settimeout(5.0)
-            self.server_socket.connect((server_ip, TCP_PORT))
+            self.server_socket.connect((server_ip, port))
             self.server_socket.settimeout(None)
             self.server_ip = server_ip
+            self._server_port = port
 
-            self.logger.system(f"Connected to server {server_ip}:{TCP_PORT}")
+            self.logger.system(f"Connected to server {server_ip}:{port}")
 
             # Send join request (include last_seq for gap recovery on reconnect)
             join_msg = json.dumps({
@@ -320,9 +324,12 @@ def main():
                         help="Chat username")
     parser.add_argument("--server", "-s", type=str, default=None,
                         help="Server IP (skip discovery)")
+    parser.add_argument("--port", "-p", type=int, default=None,
+                        help="Server TCP port (default: 10004)")
     args = parser.parse_args()
 
-    client = ChatClient(username=args.username, server_ip=args.server)
+    client = ChatClient(username=args.username, server_ip=args.server,
+                        server_port=args.port)
 
     def shutdown(sig, frame):
         print("\n")

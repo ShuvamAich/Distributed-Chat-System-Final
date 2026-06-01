@@ -47,7 +47,8 @@ class ChatServer:
         self.logger = SystemLogger(self.my_ip, "SERVER")
 
         # Middleware services
-        self.discovery = DiscoveryService(self.my_ip, ROLE_SERVER, self.logger)
+        self.discovery = DiscoveryService(self.my_ip, ROLE_SERVER, self.logger,
+                                          tcp_port=self.tcp_port)
         self.election = LCRElection(self.my_ip, self.logger,
                                     get_alive_callback=self._get_alive_members)
         self.heartbeat = HeartbeatService(

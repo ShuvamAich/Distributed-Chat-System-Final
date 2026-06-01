@@ -24,11 +24,12 @@ from common.network import get_local_ip
 class DiscoveryService:
     """UDP broadcast-based discovery for servers and clients."""
 
-    def __init__(self, node_ip, role, logger):
+    def __init__(self, node_ip, role, logger, tcp_port=None):
         self.node_ip = node_ip
         self.role = role
+        self.tcp_port = tcp_port
         self.logger = logger
-        self.discovered_nodes = {}  # ip -> {role, last_seen}
+        self.discovered_nodes = {}  # ip -> {role, tcp_port, last_seen}
         self._lock = threading.Lock()
         self._running = False
 
@@ -82,6 +83,7 @@ class DiscoveryService:
                     "type": MSG_DISCOVERY_ANNOUNCE,
                     "ip": self.node_ip,
                     "role": self.role,
+                    "tcp_port": self.tcp_port,
                 })
 
                 broadcast_socket.sendto(
@@ -118,6 +120,7 @@ class DiscoveryService:
                         is_new = sender_ip not in self.discovered_nodes
                         self.discovered_nodes[sender_ip] = {
                             "role": msg.get("role", ROLE_SERVER),
+                            "tcp_port": msg.get("tcp_port"),
                             "last_seen": time.time(),
                         }
 
