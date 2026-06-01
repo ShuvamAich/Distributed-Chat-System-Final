@@ -160,6 +160,15 @@ class HeartbeatService:
                         f"Unresponsive for >{HEARTBEAT_TIMEOUT}s")
                     self.on_leader_failed()
 
+    def mark_alive(self, node_ip):
+        """Mark a node as alive — called when any message is received from it.
+        Any communication from a server is implicit proof of liveness."""
+        with self._lock:
+            if node_ip in self.monitored_nodes:
+                self.monitored_nodes[node_ip] = time.time()
+            if node_ip == self.leader_ip:
+                self.last_leader_heartbeat = time.time()
+
     def update_monitored_nodes(self, node_ips):
         with self._lock:
             current = set(self.monitored_nodes.keys())

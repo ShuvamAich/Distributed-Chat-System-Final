@@ -260,6 +260,9 @@ class ChatServer:
                 msg = json.loads(data.decode())
                 msg_type = msg.get("type")
 
+                # Any message from a server = implicit heartbeat (proof of liveness)
+                self.heartbeat.mark_alive(addr[0])
+
                 if msg_type == MSG_CHAT_ORDERED:
                     self._handle_ordered_message(msg)
                 elif msg_type == MSG_SERVER_SHUTDOWN:
