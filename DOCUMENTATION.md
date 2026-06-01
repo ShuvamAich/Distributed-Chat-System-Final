@@ -39,7 +39,7 @@ Based on fundamental distributed systems patterns demonstrated in the example co
 | Concurrency | Multi-threading (I/O bound) |
 | Leader Election | LCR Ring Algorithm — `lcr-template.py` pattern |
 | Ring Formation | Binary IP sort — `ring.py` pattern |
-| Message Ordering | Causal Ordering (Vector Clocks — extends `lamport_clock.py`) + Total Ordering (Leader Sequencer) |
+| Message Ordering | Lamport Timestamps (`lamport_clock.py` pattern) + Total Ordering (Leader Sequencer) |
 | Reliability | ACK/NACK + Client send buffer + Server pending queue |
 | Fault Tolerance | Heartbeat-based crash detection + auto re-election + message replication + reconnect with gap recovery |
 | Group Membership | View-change protocol |
@@ -53,7 +53,8 @@ distributed_chat/
 │   ├── message.py           # Message protocol (serialization)
 │   ├── network.py           # form_ring(), get_neighbour(), get_local_ip()
 │   ├── logger.py            # Rich terminal logging with timestamps
-│   └── vector_clock.py      # Vector clock implementation (extends lamport_clock.py)
+│   ├── lamport_clock.py      # Lamport clock implementation (from lamport_clock.py example)
+│   └── vector_clock.py      # Vector clock (unused — kept for reference/comparison)
 ├── middleware/              # Custom middleware layer
 │   ├── discovery.py         # UDP broadcast discovery
 │   ├── election.py          # LCR ring election via UDP
@@ -341,62 +342,115 @@ All servers store the same `chat_history` (replicated via leader multicast). Whe
 
 ## 8. Message Ordering
 
-### Choice: Causal Ordering (Vector Clocks) + Total Ordering (Leader Sequencer)
+### Choice: Lamport Timestamps + Total Ordering (Leader Sequencer)
 
-### Vector Clock Synchronization (extends `lamport_clock.py`)
+### Lamport Clock (from `lamport_clock.py` example)
 
-The `lamport_clock.py` example demonstrates logical timestamps with a single counter. We extend this to **vector clocks** — one entry per participant — to capture causal relationships across multiple senders.
+The `lamport_clock.py` example demonstrates logical timestamps for ordering events across processes. We use Lamport clocks directly — each participant maintains a single integer counter.
 
-**Who maintains vector clocks:**
+**Lamport Clock Rules (from example code):**
 
-| Participant | Clock Contains |
-|-------------|---------------|
-| Client (Alice) | Entry per client: `{Alice: n, Bob: m, ...}` |
-| Client (Bob) | Entry per client: `{Alice: n, Bob: m, ...}` |
-| Leader server | Merged entries from all clients + own sequencer counter |
+```python
+def local_event(pid, clock):
+    clock += 1                              # Rule 1: increment on local event
+    return clock
+
+def send_event(pipe, pid, clock):
+    clock += 1                              # Rule 2: increment before sending
+    pipe.send((pid, clock))
+    return clock
+
+def receive_event(pipe, pid, clock):
+    sender_id, ts = pipe.recv()
+    clock = max(ts, clock) + 1              # Rule 3: max(local, received) + 1
+    return clock
+```
+
+**Who maintains Lamport clocks:**
+
+| Participant | Clock | Actions |
+|-------------|-------|---------|
+| Client (Alice) | Single integer | Increment on send, update on receive |
+| Client (Bob) | Single integer | Increment on send, update on receive |
+| Leader server | Single integer | Update from client's TS, then increment |
 
 **Synchronization flow:**
 
 ```
 Alice sends "Hi"
-  → Alice increments: VC = {Alice: 1}
-  → Message carries VC = {Alice: 1}
-  → Server (leader) merges Alice's VC into its own, increments
-  → Leader VC = {Alice: 1, Leader: 1}
-  → Ordered message sent to all with VC = {Alice: 1, Leader: 1}
+  → Alice increments: LT = 1
+  → Message carries ts = 1
+  → Server (leader) receives: LT = max(server_LT=0, client_ts=1) + 1 = 2
+  → Ordered message sent to all with ts = 2
 
 Bob receives message
-  → Bob merges: VC = max(Bob.VC, received.VC) = {Alice: 1, Leader: 1}
+  → Bob updates: LT = max(bob_LT=0, received_ts=2) + 1 = 3
 
 Bob sends "Hey"
-  → Bob increments: VC = {Alice: 1, Leader: 1, Bob: 1}
-  → Server merges, increments: VC = {Alice: 1, Leader: 2, Bob: 1}
-  → Alice receives, merges
+  → Bob increments: LT = 4
+  → Server receives: LT = max(server_LT=2, client_ts=4) + 1 = 5
+  → Ordered message sent to all with ts = 5
+  → Alice receives: LT = max(alice_LT=1, received_ts=5) + 1 = 6
 ```
 
-**Why this proves causal order:** If Bob's message has `VC = {Alice: 1, Bob: 1}`, it means Bob's message was causally *after* Alice's first message. Any observer can verify this relationship.
+**What Lamport timestamps guarantee:** If event A causally precedes event B, then `L(A) < L(B)`. However, `L(A) < L(B)` does NOT guarantee A caused B — concurrent events may have any ordering.
 
-### Total Ordering (Sequencer)
+### Total Ordering (Leader Sequencer)
 
-The leader also assigns a monotonic **sequence number** to each message. This provides a total order for:
-- Replication (all servers store messages in the same order)
-- Gap detection (clients know if they missed messages)
+The leader assigns a monotonic **sequence number** to each message. This is the PRIMARY ordering mechanism:
+
+- **Seq#1, Seq#2, Seq#3...** — strictly monotonic, gap-free
+- All participants deliver messages in seq# order
+- Same sequence seen by every client → total ordering
+
+This provides:
+- Consistent replication (all servers store messages in the same order)
+- Gap detection (clients know if they missed messages via `last_seq`)
 - History replay (reconnecting clients request messages after their `last_seq`)
 
-### Why Both?
+### Display Format
 
-| Ordering Type | Purpose | Mechanism |
-|--------------|---------|-----------|
-| **Causal** (Vector Clocks) | Prove causal relationships between messages | Client VCs merged through leader |
-| **Total** (Sequence Numbers) | Consistent replication, gap detection | Leader assigns monotonic seq# |
+Messages show both ordering mechanisms:
+```
+[14:30:01] [Seq#1|LT:2] Alice: Hello
+[14:30:02] [Seq#2|LT:5] Bob: Hi there
+```
+
+Where:
+- `Seq#` = Total order (from leader's sequence counter)
+- `LT:` = Lamport timestamp (logical time synchronized across all participants)
+
+### Why Lamport + Total (not Vector Clocks)?
+
+| Aspect | Lamport Clock | Vector Clock |
+|--------|--------------|-------------|
+| Space per message | Single integer (`ts: 5`) | Dict of all participants (`vc: {Alice:3, Bob:2, Leader:5}`) |
+| Proves causality | Only `L(A) < L(B)` if A→B | Full: can prove A→B, A‖B (concurrent) |
+| Detects concurrency | No | Yes |
+| Complexity | Trivial | Grows with participant count |
+| Needed for our system? | Total order comes from seq# anyway | Overkill — seq# already gives total order |
+
+**Decision:** Since total ordering is guaranteed by the leader's sequence number, we don't need vector clocks to prove causality. Lamport timestamps provide logical time tracking with minimal overhead. The seq# is the source of truth for ordering.
 
 ### Why Not FIFO Only?
 
 FIFO guarantees Alice's messages arrive in order relative to each other, but says nothing about cross-sender ordering. If Alice asks "What time?" and Bob replies "3 PM", FIFO doesn't guarantee all clients see Alice's question before Bob's answer.
 
-### Why Not Total Only?
+Our system provides **Total Ordering** (stronger than FIFO):
+```
+FIFO ⊂ Causal ⊂ Total
+```
 
-Pure total ordering (every message through sequencer) adds latency. With vector clocks, we can additionally *prove* causal relationships, which is useful for debugging and auditing message flow.
+Every participant sees every message in the exact same global order.
+
+### Ordering During Faults
+
+| Fault | Impact | Mechanism |
+|-------|--------|-----------|
+| Non-leader dies | No impact — seq# continues | Leader alive, counter uninterrupted |
+| Leader dies | Brief pause during election | New leader reads max(seq) from chat_history, continues from there |
+| Multiple servers die | Same as leader dies | Survivor's history has all replicated messages |
+| Messages during election | Queued in `_pending_queue` | Flushed with next seq# after new leader established |
 
 ---
 
@@ -590,7 +644,7 @@ Example: 5 servers, kill 3 (including leader)
 ║  │   Client A    │   │   Client B    │   │   Client C    │                 ║
 ║  │  (Alice)      │   │  (Bob)        │   │  (Carol)      │                 ║
 ║  │               │   │               │   │               │                 ║
-║  │ • Vector Clock│   │ • Vector Clock│   │ • Vector Clock│                 ║
+║  │ • Lamport Clk │   │ • Lamport Clk │   │ • Lamport Clk │                 ║
 ║  │ • Send Buffer │   │ • Send Buffer │   │ • Send Buffer │                 ║
 ║  │ • Auto-Recon  │   │ • Auto-Recon  │   │ • Auto-Recon  │                 ║
 ║  │ • Gap Recovery│   │ • Gap Recovery│   │ • Gap Recovery│                 ║
@@ -616,7 +670,7 @@ Example: 5 servers, kill 3 (including leader)
 ║  MIDDLEWARE LAYER (Custom - No ZooKeeper/Kafka)                              ║
 ║  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐         ║
 ║  │Discovery │ │Election  │ │Heartbeat │ │ Ordering │ │Reliability│         ║
-║  │(UDP Bcast)│ │(LCR/UDP) │ │  (UDP)   │ │(VClock)  │ │(ACK/Retry)│         ║
+║  │(UDP Bcast)│ │(LCR/UDP) │ │  (UDP)   │ │(Lamport) │ │(ACK/Retry)│         ║
 ║  └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘         ║
 ║  ┌──────────┐                                                                ║
 ║  │Group View│                                                                ║
@@ -724,7 +778,7 @@ python run_client.py --username Bob --server 127.0.0.2
 | # | Scenario | What to do | What to observe |
 |---|----------|-----------|-----------------|
 | 1 | Cluster formation | Start servers one by one | Discovery logs, ring formation, LCR votes, leader banner |
-| 2 | Message exchange | Type messages as Alice and Bob | Sequence numbers, vector clocks, delivery to both clients |
+| 2 | Message exchange | Type messages as Alice and Bob | Sequence numbers, Lamport timestamps, delivery to both clients |
 | 3 | Server failure | Kill a non-leader server | Client reconnects, buffered messages sent, gap recovery |
 | 4 | Leader failure | Kill the leader | Heartbeat timeout, re-election, pending queue flushed |
 | 5 | Multiple failures | Kill multiple servers | Alive-check, ring shrink, self-election |
@@ -735,7 +789,7 @@ python run_client.py --username Bob --server 127.0.0.2
 
 **Server:** `status` (show cluster state), `quit` (graceful shutdown)
 
-**Client:** `/status` (connection info + vector clock), `/history` (last 20 messages), `/quit` (leave)
+**Client:** `/status` (connection info + Lamport clock), `/history` (last 20 messages), `/quit` (leave)
 
 ### What to Point Out in Logs
 
@@ -774,11 +828,12 @@ python run_client.py --username Bob --server 127.0.0.2
 - Ensures consistent ordering across all nodes
 - Correct numeric comparison (avoids string sort issues like `"9" > "10"`)
 
-#### Vector Clocks over Lamport Timestamps
-- `lamport_clock.py` shows single-counter logical time
-- Vector clocks extend this to capture **which** event caused **which**
-- Enables proving causal relationships (not just ordering)
-- Each client entry tracks its own contribution independently
+#### Lamport Timestamps (not Vector Clocks)
+- Directly based on `lamport_clock.py` example pattern
+- Single integer per node — minimal message overhead
+- Total ordering is guaranteed by the leader's seq# anyway
+- Vector clocks would add complexity without additional delivery benefit
+- Lamport still guarantees: if A caused B then L(A) < L(B)
 
 #### TCP for Clients, UDP for Servers
 - Clients need reliable, ordered delivery → TCP
@@ -846,7 +901,7 @@ python run_client.py --username Bob --server 127.0.0.2
 | `simpleserver.py` | Server UDP socket pattern for heartbeats and chat |
 | `simpleclient.py` | Client TCP connection pattern |
 | `simplemultiserver.py` | Multi-threaded server (one thread per client) |
-| `lamport_clock.py` | Extended to vector clocks for causal ordering |
+| `lamport_clock.py` | Lamport clock used directly for logical time ordering |
 
 ## Appendix D: Comparison with Real Systems
 
