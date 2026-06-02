@@ -15,10 +15,10 @@ import time
 
 from common.constants import (
     BROADCAST_IP, BROADCAST_PORT, DISCOVERY_INTERVAL,
-    MSG_DISCOVERY_ANNOUNCE, MSG_DISCOVERY_RESPONSE,
+    MSG_DISCOVERY_ANNOUNCE, MSG_DISCOVERY_REQUEST, MSG_DISCOVERY_RESPONSE,
     ROLE_SERVER, ROLE_CLIENT, BUFFER_SIZE,
 )
-from common.network import get_local_ip
+from common.network import get_broadcast_addresses
 
 
 class DiscoveryService:
@@ -86,13 +86,14 @@ class DiscoveryService:
                     "tcp_port": self.tcp_port,
                 })
 
-                broadcast_socket.sendto(
-                    str.encode(announcement), (BROADCAST_IP, BROADCAST_PORT))
+                for target in get_broadcast_addresses(self.node_ip):
+                    broadcast_socket.sendto(
+                        str.encode(announcement), (target, BROADCAST_PORT))
                 broadcast_socket.close()
 
                 self.logger.discovery(
                     f"Broadcast announcement sent",
-                    f"IP={self.node_ip}, Port={BROADCAST_PORT}")
+                    f"IP={self.node_ip}, Targets={get_broadcast_addresses(self.node_ip)}")
             except Exception as e:
                 self.logger.fault(f"Broadcast send error: {e}")
 
@@ -111,7 +112,18 @@ class DiscoveryService:
                 data, addr = listen_socket.recvfrom(BUFFER_SIZE)
                 if data:
                     msg = json.loads(data.decode())
+                    msg_type = msg.get("type")
                     sender_ip = msg.get("ip", addr[0])
+
+                    if msg_type == MSG_DISCOVERY_REQUEST and self.role == ROLE_SERVER:
+                        response = json.dumps({
+                            "type": MSG_DISCOVERY_RESPONSE,
+                            "ip": self.node_ip,
+                            "role": self.role,
+                            "tcp_port": self.tcp_port,
+                        }).encode()
+                        listen_socket.sendto(response, addr)
+                        continue
 
                     if sender_ip == self.node_ip:
                         continue

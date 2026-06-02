@@ -68,7 +68,7 @@ class HeartbeatService:
         """Listen for heartbeat messages via UDP."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((self.my_ip, HEARTBEAT_PORT))
+        sock.bind(("0.0.0.0", HEARTBEAT_PORT))
         sock.settimeout(1.0)
 
         while self._running:

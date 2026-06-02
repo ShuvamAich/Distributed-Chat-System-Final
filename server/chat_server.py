@@ -135,7 +135,7 @@ class ChatServer:
         """Start TCP server for client connections (like simpleserver.py)."""
         self._tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._tcp_socket.bind((self.my_ip, self.tcp_port))
+        self._tcp_socket.bind(("0.0.0.0", self.tcp_port))
         self._tcp_socket.listen(10)
         self._tcp_socket.settimeout(1.0)
 
@@ -252,7 +252,7 @@ class ChatServer:
         """Receive ordered messages from leader via UDP."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((self.my_ip, CHAT_PORT))
+        sock.bind(("0.0.0.0", CHAT_PORT))
         sock.settimeout(1.0)
 
         while self._running:

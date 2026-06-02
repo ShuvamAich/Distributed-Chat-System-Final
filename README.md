@@ -37,7 +37,11 @@ python run_client.py --username Alice
 python run_client.py --username Bob
 ```
 
-Servers auto-discover each other via UDP broadcast. Clients auto-discover servers. No IPs needed — everything is automatic on a LAN.
+Servers auto-discover each other via UDP broadcast. Clients auto-discover servers. No IPs needed — everything is automatic on a LAN, provided UDP/TCP traffic on the chat ports is allowed by the OS firewall.
+
+For a single local server on the same machine, client auto-discovery also works. For multi-server single-machine demos, use the explicit loopback IP setup below.
+
+If two different Windows machines do not discover each other, allow inbound UDP on ports 5972, 7001, 7002, 7003 and inbound TCP on port 7004 on both machines, and make sure both are on the same IPv4 subnet.
 
 ### Single-Machine Demo (loopback)
 

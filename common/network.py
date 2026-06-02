@@ -3,6 +3,7 @@ Network utility functions — get local IP, form ring, get neighbour.
 Based on ring.py example code pattern.
 """
 
+import ipaddress
 import socket
 
 
@@ -16,6 +17,30 @@ def get_local_ip():
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+def get_broadcast_addresses(ip_address=None):
+    """Return likely IPv4 broadcast targets for the current subnet.
+
+    Uses limited broadcast plus a /24 directed broadcast derived from the
+    detected local IP, which matches common home and campus LAN layouts.
+    """
+    ip_address = ip_address or get_local_ip()
+    targets = ["255.255.255.255"]
+
+    try:
+        parsed_ip = ipaddress.ip_address(ip_address)
+        if parsed_ip.version == 4 and not parsed_ip.is_loopback:
+            network = ipaddress.ip_network(f"{ip_address}/24", strict=False)
+            targets.append(str(network.broadcast_address))
+    except ValueError:
+        pass
+
+    unique_targets = []
+    for target in targets:
+        if target not in unique_targets:
+            unique_targets.append(target)
+    return unique_targets
 
 
 def form_ring(members):

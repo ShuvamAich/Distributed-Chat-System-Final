@@ -5,10 +5,10 @@ System-wide constants for the distributed chat system.
 # Network Configuration
 BROADCAST_IP = "255.255.255.255"  # Subnet broadcast (works on most LANs)
 BROADCAST_PORT = 5972             # Discovery broadcast port
-RING_PORT = 10001                 # LCR election ring port (UDP)
-CHAT_PORT = 10002                 # Chat message port (UDP)
-HEARTBEAT_PORT = 10003            # Heartbeat port (UDP)
-TCP_PORT = 10004                  # TCP port for reliable delivery
+RING_PORT = 7001                  # LCR election ring port (UDP)
+CHAT_PORT = 7002                  # Chat message port (UDP)
+HEARTBEAT_PORT = 7003             # Heartbeat port (UDP)
+TCP_PORT = 7004                   # TCP port for reliable delivery
 
 # Buffer size for UDP
 BUFFER_SIZE = 4096
@@ -24,6 +24,7 @@ MESSAGE_RETRY_MAX = 5
 
 # Protocol Message Types
 MSG_DISCOVERY_ANNOUNCE = "DISCOVERY_ANNOUNCE"
+MSG_DISCOVERY_REQUEST = "DISCOVERY_REQUEST"
 MSG_DISCOVERY_RESPONSE = "DISCOVERY_RESPONSE"
 MSG_JOIN_REQUEST = "JOIN_REQUEST"
 MSG_JOIN_APPROVED = "JOIN_APPROVED"

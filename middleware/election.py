@@ -43,7 +43,7 @@ class LCRElection:
         self._running = True
         self._ring_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._ring_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._ring_socket.bind((self.my_ip, RING_PORT))
+        self._ring_socket.bind(("0.0.0.0", RING_PORT))
         self._ring_socket.settimeout(1.0)
 
         t = threading.Thread(target=self._listen_loop, daemon=True)

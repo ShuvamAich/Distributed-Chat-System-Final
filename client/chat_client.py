@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.constants import *
 from common.logger import SystemLogger
-from common.network import get_local_ip
+from common.network import get_broadcast_addresses, get_local_ip
 from common.lamport_clock import LamportClock
 
 
@@ -145,22 +145,38 @@ class ChatClient:
         listen_socket.bind(("0.0.0.0", BROADCAST_PORT))
         listen_socket.settimeout(2.0)
 
+        def send_discovery_probe():
+            probe = json.dumps({
+                "type": MSG_DISCOVERY_REQUEST,
+                "ip": self.my_ip,
+                "role": ROLE_CLIENT,
+            }).encode()
+            for target in get_broadcast_addresses(self.my_ip):
+                try:
+                    listen_socket.sendto(probe, (target, BROADCAST_PORT))
+                except OSError as exc:
+                    self.logger.fault(f"Discovery probe send failed: {exc}")
+
+        send_discovery_probe()
+
         while self._running and not self.joined:
             try:
                 data, addr = listen_socket.recvfrom(BUFFER_SIZE)
                 if data:
                     msg = json.loads(data.decode())
-                    if msg.get("type") == MSG_DISCOVERY_ANNOUNCE:
+                    if msg.get("type") in (MSG_DISCOVERY_ANNOUNCE, MSG_DISCOVERY_RESPONSE):
                         server_ip = msg.get("ip", addr[0])
                         server_port = msg.get("tcp_port") or TCP_PORT
-                        if server_ip != self.my_ip:
-                            self.logger.discovery(
-                                f"Found server: {server_ip}:{server_port}")
-                            listen_socket.close()
-                            self._connect_to_server(server_ip, server_port)
-                            return
+                        self.logger.discovery(
+                            f"Found server: {server_ip}:{server_port}")
+                        listen_socket.close()
+                        self._connect_to_server(server_ip, server_port)
+                        return
             except socket.timeout:
-                self.logger.discovery("No server found yet, listening...")
+                send_discovery_probe()
+                self.logger.discovery(
+                    "No server found yet, listening...",
+                    f"Probe targets={get_broadcast_addresses(self.my_ip)}")
                 continue
             except Exception as e:
                 if self._running:
