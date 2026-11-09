@@ -1,20 +1,22 @@
 """
-Chat Server — a node in the distributed server cluster.
-Based on simpleserver.py/simplemultiserver.py example patterns.
+Chat Server — a node in the distributed server cluster (AP design).
 
-Uses:
-- UDP broadcast for discovery (broadcastsender.py pattern)
-- UDP ring for LCR election (lcr-template.py pattern)
-- TCP for reliable chat message delivery (simpleserver.py pattern)
-- Threading for concurrent listeners
+Availability-first. There is NO leader on the message path and NO global
+sequence number. Every server:
 
-Each server:
-1. Broadcasts its presence for discovery.
-2. Forms a ring with other servers (ring.py pattern).
-3. Participates in LCR leader election (lcr-template.py pattern).
-4. Accepts client connections via TCP.
-5. Leader sequences and multicasts chat messages.
-6. Monitors cluster health via UDP heartbeats.
+1. Broadcasts its presence for discovery (UDP broadcast).
+2. Forms an LCR ring for leader election — CONTROL PLANE ONLY.
+3. Accepts client connections over TCP.
+4. On a client message: stamps it with a vector clock + Lamport timestamp,
+   delivers it to its own clients immediately, and gossips it peer-to-peer to
+   every other server (full mesh) — no leader hop.
+5. Delivers incoming peer messages in causal order (vector clocks), converging
+   to an eventual total order sorted by (lamport, origin, counter).
+6. Fills gaps with decentralized anti-entropy (no central ACK/retransmit).
+
+The elected leader does only control-plane work: heartbeat liveness + the
+authoritative membership list. If it is down or being re-elected, chat keeps
+flowing — which is the whole point of keeping it off the message path.
 """
 
 import sys
@@ -30,226 +32,192 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.constants import *
 from common.logger import SystemLogger
-from common.network import get_local_ip, form_ring, get_neighbour
-from common.lamport_clock import LamportClock
+from common.network import get_local_ip
 from middleware.discovery import DiscoveryService
 from middleware.election import LCRElection
 from middleware.heartbeat import HeartbeatService
-from middleware.reliability import ReliableMulticast
+from middleware.group_view import GroupView
+from middleware.ordering import CausalDelivery
+from middleware.antientropy import AntiEntropy
 
 
 class ChatServer:
-    """Distributed chat server node."""
+    """Distributed chat server node (availability-first)."""
 
     def __init__(self, ip=None, tcp_port=None):
         self.my_ip = ip or get_local_ip()
         self.tcp_port = tcp_port or TCP_PORT
+        self.epoch = int(time.time())
+        self.node_id = f"{self.my_ip}:{self.epoch}"   # stable per-incarnation id
         self.logger = SystemLogger(self.my_ip, "SERVER")
+
+        # Demo-only simulated partition: IPs whose packets we drop in both directions.
+        self._blocked_peers = set()
 
         # Middleware services
         self.discovery = DiscoveryService(self.my_ip, ROLE_SERVER, self.logger,
-                                          tcp_port=self.tcp_port)
+                                          tcp_port=self.tcp_port,
+                                          block_filter=self.is_blocked)
         self.election = LCRElection(self.my_ip, self.logger,
-                                    get_alive_callback=self._get_alive_members)
+                                    get_alive_callback=self._get_alive_members,
+                                    block_filter=self.is_blocked)
         self.heartbeat = HeartbeatService(
             self.my_ip, self.logger,
-            self._on_server_failed, self._on_leader_failed)
-        self.reliable_multicast = ReliableMulticast(
-            self.my_ip, self.logger, self._udp_send_for_retransmit)
+            self._on_server_failed, self._on_leader_failed,
+            block_filter=self.is_blocked)
+        self.group_view = GroupView(self.my_ip, self.logger)
+
+        # Causal-delivery engine (replaces the leader sequencer)
+        self.delivery = CausalDelivery(self.node_id, self.logger,
+                                       HOLDBACK_TIMEOUT, time.time)
+        # Decentralized gap-fill (replaces leader ACK/retransmit)
+        self.antientropy = AntiEntropy(self.my_ip, self.logger, self.delivery,
+                                       self._udp_chat_send, self._alive_peers,
+                                       GAP_CHECK_INTERVAL)
 
         # State
-        self.lamport_clock = LamportClock()
-        self.connected_clients = {}  # client_ip:port -> socket
-        self.client_names = {}  # client_ip:port -> username
-        self.chat_history = []  # list of ordered messages
-        self.sequence_counter = 0
-        self.server_members = []  # current ring members
-        self._known_members = set()  # tracks what cluster_join_loop last saw
-        self._pending_queue = []  # messages queued during leader election
+        self.connected_clients = {}   # client_key -> socket
+        self.client_names = {}        # client_key -> username
+        self.server_members = []      # current known server IPs
+        self._known_members = set()   # what the cluster-join loop last acted on
         self._lock = threading.Lock()
         self._running = False
         self._tcp_socket = None
 
+    # --- Lifecycle ---
+
     def start(self):
-        """Start all server services."""
         self._running = True
-        self.logger.banner(f"CHAT SERVER STARTING AT {self.my_ip}")
-        self.logger.system(f"TCP Port: {self.tcp_port}")
-        self.logger.system(f"Ring Port (UDP): {RING_PORT}")
-        self.logger.system(f"Heartbeat Port (UDP): {HEARTBEAT_PORT}")
-        self.logger.system(f"Broadcast Port (UDP): {BROADCAST_PORT}")
-        self.logger.system(f"PID: {os.getpid()}")
+        self.logger.banner(f"CHAT SERVER STARTING AT {self.my_ip} (epoch {self.epoch})")
+        self.logger.system(f"Node ID: {self.node_id}")
+        self.logger.system(f"TCP Port: {self.tcp_port}  Chat/UDP: {CHAT_PORT}")
+        self.logger.system("Mode: AP (causal consistency, leader OFF message path)")
         self.logger.separator()
 
-        # Start TCP listener for clients
         self._start_tcp_listener()
-
-        # Start UDP chat listener (for server-to-server messages)
         self._start_chat_listener()
-
-        # Start discovery
         self.discovery.start()
-
-        # Start election ring listener
         self.election.start()
+        self.antientropy.start()
 
-        # Start reliable multicast (ACK tracking + retransmit)
-        self.reliable_multicast.start()
-
-        # Start cluster formation
         threading.Thread(target=self._cluster_join_loop, daemon=True).start()
+        threading.Thread(target=self._force_release_loop, daemon=True).start()
 
         self.logger.system("All services started — waiting for cluster formation")
 
     def stop(self):
-        """Gracefully shut down."""
         self._running = False
         self.logger.banner("SERVER SHUTTING DOWN")
-
-        # Notify other servers
-        self._broadcast_to_servers({
-            "type": MSG_SERVER_SHUTDOWN,
-            "from": self.my_ip
-        })
-
+        self._broadcast_to_servers({"type": MSG_SERVER_SHUTDOWN, "from": self.my_ip})
         self.heartbeat.stop()
         self.discovery.stop()
         self.election.stop()
+        self.antientropy.stop()
         if self._tcp_socket:
             self._tcp_socket.close()
-
-        # Close client connections
         with self._lock:
-            for key, sock in self.connected_clients.items():
+            for sock in self.connected_clients.values():
                 try:
                     sock.close()
                 except Exception:
                     pass
             self.connected_clients.clear()
-
         self.logger.system("Server stopped cleanly")
 
-    # --- TCP Listener (for clients) ---
+    # --- TCP Listener (clients) ---
 
     def _start_tcp_listener(self):
-        """Start TCP server for client connections (like simpleserver.py)."""
         self._tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._tcp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._tcp_socket.bind(("0.0.0.0", self.tcp_port))
         self._tcp_socket.listen(10)
         self._tcp_socket.settimeout(1.0)
-
-        t = threading.Thread(target=self._tcp_accept_loop, daemon=True)
-        t.start()
+        threading.Thread(target=self._tcp_accept_loop, daemon=True).start()
         self.logger.system(f"TCP listener started on {self.my_ip}:{self.tcp_port}")
 
     def _tcp_accept_loop(self):
-        """Accept incoming TCP connections from clients."""
         while self._running:
             try:
                 conn, addr = self._tcp_socket.accept()
                 client_key = f"{addr[0]}:{addr[1]}"
                 self.logger.system(f"Client connected from {client_key}")
-                t = threading.Thread(target=self._handle_client, args=(conn, addr), daemon=True)
-                t.start()
+                threading.Thread(target=self._handle_client,
+                                 args=(conn, addr), daemon=True).start()
             except socket.timeout:
                 continue
             except OSError:
                 break
 
     def _handle_client(self, conn, addr):
-        """Handle messages from a connected client."""
         client_key = f"{addr[0]}:{addr[1]}"
         with self._lock:
             self.connected_clients[client_key] = conn
-
         try:
             while self._running:
                 data = self._tcp_recv(conn)
                 if data is None:
                     break
-                msg = json.loads(data.decode())
-                self._handle_client_message(msg, conn, client_key)
+                self._handle_client_message(json.loads(data.decode()), conn, client_key)
         except (ConnectionResetError, BrokenPipeError, OSError):
             pass
         finally:
             self._client_disconnected(client_key)
 
     def _handle_client_message(self, msg, conn, client_key):
-        """Route client messages by type."""
         msg_type = msg.get("type")
 
         if msg_type == MSG_JOIN_REQUEST:
             username = msg.get("username", client_key)
-            last_seq = msg.get("last_seq", 0)
+            marker = msg.get("marker", {})   # client's last-seen per-origin counters
             with self._lock:
                 self.client_names[client_key] = username
-            self.logger.system(
-                f"Join request from {username} ({client_key}), last_seq={last_seq}")
+            self.group_view.add_client(client_key, username)
+            self.logger.system(f"Join request from {username} ({client_key})")
 
-            # Send approval
-            approval = {
+            self._tcp_send(conn, json.dumps({
                 "type": MSG_JOIN_APPROVED,
                 "leader": self.election.get_leader(),
                 "members": self.server_members,
-            }
-            self._tcp_send(conn, json.dumps(approval).encode())
+            }).encode())
 
-            # Send missed messages (only those after client's last received seq)
-            with self._lock:
-                if last_seq > 0:
-                    # Reconnecting client — send only missed messages
-                    missed = [m for m in self.chat_history
-                              if m.get("seq") and m["seq"] > last_seq]
-                else:
-                    # New client — send recent history
-                    missed = self.chat_history[-50:]
-
+            # Catch the client up on whatever it is missing (works across reconnects
+            # to a different server — causal context preserved via the marker).
+            missed = self.delivery.missed_for_client(marker)
             if missed:
-                self.logger.sync(
-                    f"Sending {len(missed)} messages to {username}",
-                    f"From seq#{last_seq + 1} onward")
-                sync = {"type": MSG_SYNC_RESPONSE, "messages": missed}
-                self._tcp_send(conn, json.dumps(sync).encode())
+                self.logger.sync(f"Catching up {username} with {len(missed)} message(s)")
+                self._tcp_send(conn, json.dumps({
+                    "type": MSG_SYNC_RESPONSE,
+                    "messages": [self._client_view(e) for e in missed],
+                }).encode())
 
-            # Only announce join for new clients (not reconnects)
-            if last_seq == 0:
-                self._process_chat_message(
-                    f"*** {username} has joined the chat ***", "SYSTEM", is_system=True)
-            else:
-                self._process_chat_message(
-                    f"*** {username} reconnected ***", "SYSTEM", is_system=True)
+            notice = ("joined" if not marker else "reconnected")
+            self._originate(f"*** {username} has {notice} the chat ***",
+                            "SYSTEM", system=True)
 
         elif msg_type == MSG_CHAT_MESSAGE:
             text = msg.get("text", "")
             username = self.client_names.get(client_key, client_key)
-            client_ts = msg.get("ts", 0)
-            self.logger.message(
-                f"Chat from {username}: \"{text}\"",
-                f"Client Lamport TS={client_ts}")
-            self._process_chat_message(text, username, client_ts=client_ts)
+            self.logger.message(f"Chat from {username}: \"{text}\"")
+            self._originate(text, username)
 
         elif msg_type == MSG_CLIENT_DISCONNECT:
             username = self.client_names.get(client_key, client_key)
-            self._process_chat_message(
-                f"*** {username} has left the chat ***", "SYSTEM", is_system=True)
+            self._originate(f"*** {username} has left the chat ***",
+                            "SYSTEM", system=True)
 
     def _client_disconnected(self, client_key):
-        """Handle client disconnect."""
         with self._lock:
             self.connected_clients.pop(client_key, None)
             username = self.client_names.pop(client_key, client_key)
+        self.group_view.remove_client(client_key)
         self.logger.system(f"Client disconnected: {username} ({client_key})")
 
-    # --- UDP Chat Listener (server-to-server) ---
+    # --- Server-to-server UDP listener (chat mesh + anti-entropy) ---
 
     def _start_chat_listener(self):
-        """Listen for server-to-server chat messages via UDP."""
-        t = threading.Thread(target=self._chat_listen_loop, daemon=True)
-        t.start()
+        threading.Thread(target=self._chat_listen_loop, daemon=True).start()
 
     def _chat_listen_loop(self):
-        """Receive ordered messages from leader via UDP."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("0.0.0.0", CHAT_PORT))
@@ -258,22 +226,24 @@ class ChatServer:
         while self._running:
             try:
                 data, addr = sock.recvfrom(BUFFER_SIZE)
+                if self.is_blocked(addr[0]):
+                    continue  # simulated partition: drop peer traffic
                 msg = json.loads(data.decode())
                 msg_type = msg.get("type")
 
-                # Any message from a server = implicit heartbeat (proof of liveness)
+                # Any peer message is implicit proof of liveness.
                 self.heartbeat.mark_alive(addr[0])
 
-                if msg_type == MSG_CHAT_ORDERED:
-                    self._handle_ordered_message(msg)
+                if msg_type == MSG_CHAT_BCAST:
+                    newly = self.delivery.on_receive(msg["env"])
+                    self._deliver_to_clients(newly)
+                elif msg_type == MSG_GAP_SUMMARY:
+                    self.antientropy.handle_summary(msg["from"], msg["digest"])
+                elif msg_type == MSG_GAP_RESPONSE:
+                    newly = self.antientropy.handle_response(msg["messages"])
+                    self._deliver_to_clients(newly)
                 elif msg_type == MSG_SERVER_SHUTDOWN:
                     self._handle_server_shutdown(msg)
-                elif msg_type == MSG_CHAT_ACK:
-                    from_ip = msg.get("from")
-                    ack_seq = msg.get("seq")
-                    self.logger.reliability(
-                        f"ACK received: Seq#{ack_seq} from {from_ip}")
-                    self.reliable_multicast.handle_ack(ack_seq, from_ip)
 
             except socket.timeout:
                 continue
@@ -282,333 +252,197 @@ class ChatServer:
             except Exception as e:
                 if self._running:
                     self.logger.fault(f"Chat listener error: {e}")
-
         sock.close()
 
-    # --- Message Processing ---
+    # --- Message path (NO leader hop) ---
 
-    def _process_chat_message(self, text, username, is_system=False, client_ts=0):
-        """Process a new chat message — leader sequences and multicasts."""
-        if self.election.is_leader():
-            self._sequence_and_deliver(text, username, is_system, client_ts)
+    def _originate(self, text, username, system=False):
+        """Accept a local client's message: stamp, show locally, gossip to peers."""
+        env = self.delivery.originate(username, text, system=system)
+        self._deliver_to_clients([env])
+        self._broadcast_chat(env)
 
-        elif self.election.get_leader():
-            # Forward to leader
-            leader = self.election.get_leader()
-            forward_msg = {
-                "type": MSG_CHAT_ORDERED,
-                "text": text,
-                "username": username,
-                "forward_to_leader": True,
-                "timestamp": time.time(),
-                "system": is_system,
-                "client_ts": client_ts,
-            }
-            self._udp_send(leader, CHAT_PORT, forward_msg)
-            self.logger.message(f"Forwarded to leader {leader}")
+    def _broadcast_chat(self, env):
+        """Best-effort peer-to-peer multicast across the full server mesh."""
+        peers = [ip for ip in self.server_members if ip != self.my_ip]
+        for ip in peers:
+            self._udp_chat_send(ip, {"type": MSG_CHAT_BCAST, "env": env})
+        if peers:
+            self.logger.message(f"Gossiped {env['msg_id']} -> {peers}")
 
-        else:
-            # No leader available (election in progress) — queue for later
-            with self._lock:
-                self._pending_queue.append({
-                    "text": text, "username": username,
-                    "is_system": is_system, "client_ts": client_ts,
-                })
-            self.logger.reliability(
-                f"Message queued (no leader): \"{text}\" from {username}",
-                f"Queue size: {len(self._pending_queue)}")
+    def _force_release_loop(self):
+        """Periodically release causally-held messages whose deps never arrived."""
+        while self._running:
+            time.sleep(1.0)
+            released = self.delivery.force_release_due()
+            if released:
+                self._deliver_to_clients(released)
 
-    def _sequence_and_deliver(self, text, username, is_system=False, client_ts=0):
-        """Leader: assign sequence, multicast, deliver."""
-        # Update Lamport clock: max(local, received) + 1
-        if client_ts:
-            self.lamport_clock.update(client_ts)
-        else:
-            self.lamport_clock.increment()
-        ts = self.lamport_clock.get()
-
-        with self._lock:
-            self.sequence_counter += 1
-            seq = self.sequence_counter
-
-        ordered_msg = {
-            "type": MSG_CHAT_ORDERED,
-            "text": text,
-            "username": username,
-            "seq": seq,
-            "ts": ts,
-            "timestamp": time.time(),
-            "system": is_system,
-        }
-
-        self.logger.order(
-            f"Assigned Seq#{seq} to message",
-            f"Lamport TS={ts}, From={username}")
-
-        # Store in history (replicated log)
-        with self._lock:
-            self.chat_history.append(ordered_msg)
-
-        # Reliable multicast to other servers via UDP (with ACK tracking)
-        targets = [ip for ip in self.server_members if ip != self.my_ip]
-        if targets:
-            self.logger.reliability(
-                f"MULTICAST Seq#{seq} -> {targets}",
-                f"Awaiting ACKs from {len(targets)} server(s)")
-            for ip in targets:
-                self._udp_send(ip, CHAT_PORT, ordered_msg)
-            self.reliable_multicast.track_message(seq, ordered_msg, targets)
-        else:
-            self.logger.reliability(f"Seq#{seq} — no other servers to multicast to")
-
-        # Deliver to local clients
-        self._deliver_to_clients(ordered_msg)
-
-    def _flush_pending_queue(self):
-        """Process all queued messages after a new leader is established."""
-        with self._lock:
-            queue = list(self._pending_queue)
-            self._pending_queue.clear()
-
-        if queue:
-            self.logger.reliability(
-                f"Flushing {len(queue)} queued messages after election")
-
-        for item in queue:
-            self._process_chat_message(
-                item["text"], item["username"],
-                item["is_system"], item.get("client_ts", 0))
-
-    def _handle_ordered_message(self, msg):
-        """Received sequenced message from leader — store and deliver."""
-        if msg.get("forward_to_leader"):
-            # This is a forwarded message — we are the leader, process it
-            text = msg.get("text", "")
-            username = msg.get("username", "unknown")
-            is_system = msg.get("system", False)
-            client_ts = msg.get("client_ts", 0)
-            self._process_chat_message(text, username, is_system, client_ts=client_ts)
+    def _deliver_to_clients(self, envelopes):
+        """Push causally-delivered messages to all locally-connected clients via TCP."""
+        if not envelopes:
             return
-
-        seq = msg.get("seq")
-        self.logger.order(
-            f"Received ordered message Seq#{seq}",
-            f"From={msg.get('username')}, VC={msg.get('vc')}")
-
-        # Store in history
-        with self._lock:
-            self.chat_history.append(msg)
-
-        # Deliver to local clients
-        self._deliver_to_clients(msg)
-
-        # Send ACK to leader
-        leader = self.election.get_leader()
-        if leader:
-            ack = {"type": MSG_CHAT_ACK, "from": self.my_ip, "seq": seq}
-            self._udp_send(leader, CHAT_PORT, ack)
-            self.logger.reliability(f"ACK sent for Seq#{seq} to leader {leader}")
-
-    def _deliver_to_clients(self, msg):
-        """Deliver an ordered message to all locally connected clients via TCP."""
         with self._lock:
             clients = dict(self.connected_clients)
+        for env in envelopes:
+            payload = json.dumps({
+                "type": MSG_CHAT_DELIVER,
+                **self._client_view(env),
+            }).encode()
+            for sock in clients.values():
+                try:
+                    self._tcp_send(sock, payload)
+                except Exception:
+                    pass
 
-        delivery = json.dumps({
-            "type": MSG_CHAT_ORDERED,
-            "text": msg.get("text", ""),
-            "username": msg.get("username", ""),
-            "seq": msg.get("seq"),
-            "ts": msg.get("ts"),
-            "timestamp": msg.get("timestamp"),
-            "system": msg.get("system", False),
-        }).encode()
+    @staticmethod
+    def _client_view(env):
+        """Fields a client needs to display + maintain its last-seen marker."""
+        return {
+            "text": env["text"],
+            "username": env["username"],
+            "system": env["system"],
+            "origin_id": env["origin_id"],
+            "origin_counter": env["origin_counter"],
+            "lamport_ts": env["lamport_ts"],
+            "vector_clock": env["vector_clock"],
+        }
 
-        for key, sock in clients.items():
-            try:
-                self._tcp_send(sock, delivery)
-            except Exception:
-                pass
-
-    # --- Cluster Management ---
+    # --- Cluster management (control plane; never gates chat) ---
 
     def _cluster_join_loop(self):
-        """Periodically discover servers and form the ring."""
         time.sleep(2)
-        last_count = 0
-        stable = 0
-
+        last_count, stable = 0, 0
         while self._running:
-            servers = self.discovery.get_servers()
+            servers = self.discovery.get_alive_servers()
             all_ips = sorted(set(list(servers.keys()) + [self.my_ip]))
 
-            if len(all_ips) == last_count:
-                stable += 1
-            else:
-                stable = 0
+            stable = stable + 1 if len(all_ips) == last_count else 0
             last_count = len(all_ips)
 
-            # Trigger election when membership changes and is stable
             if stable >= 1 and set(all_ips) != self._known_members:
                 self.logger.system(
                     f"Membership changed: {sorted(self._known_members)} -> {all_ips}")
-
                 self.server_members = all_ips
                 self._known_members = set(all_ips)
+                self.group_view.install_view(all_ips, reason="membership change")
                 self.election.update_ring(all_ips)
                 self.election.start_election(
                     reason=f"membership change ({len(all_ips)} servers)")
-
-                leader = self.election.wait_for_leader(timeout=ELECTION_TIMEOUT + 5)
-                if leader:
-                    # Stop old heartbeat and restart with new configuration
+                # Control-plane wait only — chat threads are unaffected meanwhile.
+                if self.election.wait_for_leader(timeout=ELECTION_TIMEOUT + 2):
                     self.heartbeat.stop()
-                    self._post_election_setup()
+                    self._configure_heartbeat()
                 else:
                     self.logger.fault("Election timed out, will retry next cycle")
-                    # Reset so next cycle triggers again
                     self._known_members = set()
 
             time.sleep(DISCOVERY_INTERVAL)
 
-    def _post_election_setup(self):
-        """Configure heartbeats after election and flush queued messages."""
+    def _configure_heartbeat(self):
         leader = self.election.get_leader()
-        is_leader = self.election.is_leader()
-
-        if is_leader:
-            # CRITICAL: Continue sequence from where old leader left off
-            # to maintain total ordering continuity across leader changes
-            with self._lock:
-                max_seq = 0
-                for msg in self.chat_history:
-                    seq = msg.get("seq", 0)
-                    if isinstance(seq, int) and seq > max_seq:
-                        max_seq = seq
-                if max_seq > self.sequence_counter:
-                    self.logger.order(
-                        f"Continuing sequence from old leader",
-                        f"Old counter={self.sequence_counter}, "
-                        f"Max seq in history={max_seq}")
-                    self.sequence_counter = max_seq
-
-            other_ips = [ip for ip in self.server_members if ip != self.my_ip]
-            self.heartbeat.start(is_leader=True, monitored_ips=other_ips)
+        if self.election.is_leader():
+            others = [ip for ip in self.server_members if ip != self.my_ip]
+            self.heartbeat.start(is_leader=True, monitored_ips=others)
         else:
             self.heartbeat.start(is_leader=False, leader_ip=leader)
-
         self.logger.separator()
-        self.logger.system(
-            f"Post-election setup complete",
-            f"Leader={leader}, IsLeader={is_leader}")
+        self.logger.system("Control plane ready",
+                           f"Leader={leader}, IsLeader={self.election.is_leader()}")
 
-        # Flush messages that were queued during election
-        self._flush_pending_queue()
-
-    # --- Fault Tolerance ---
+    # --- Fault tolerance (control plane only) ---
 
     def _on_server_failed(self, failed_ip):
-        """Leader detected a server failure."""
         self.logger.fault(f"Server {failed_ip} FAILED — removing from cluster")
         self.server_members = [ip for ip in self.server_members if ip != failed_ip]
         self._known_members = set(self.server_members)
         self.discovery.remove_node(failed_ip)
+        self.group_view.install_view(self.server_members, reason=f"{failed_ip} crashed")
         self.election.update_ring(self.server_members)
-        other_ips = [ip for ip in self.server_members if ip != self.my_ip]
-        self.heartbeat.update_monitored_nodes(other_ips)
+        self.heartbeat.update_monitored_nodes(
+            [ip for ip in self.server_members if ip != self.my_ip])
 
     def _on_leader_failed(self):
-        """Follower detected leader failure — trigger re-election."""
         old_leader = self.election.get_leader()
-        self.logger.fault(f"Leader {old_leader} unreachable — re-electing")
-
+        self.logger.fault(f"Leader {old_leader} unreachable — re-electing "
+                          f"(chat keeps flowing)")
         self.heartbeat.stop()
-
-        # Check who is actually still alive (broadcasting recently)
         self.discovery.remove_node(old_leader)
-        alive_servers = self.discovery.get_alive_servers()
-        alive_ips = sorted(set(list(alive_servers.keys()) + [self.my_ip]))
-        # Ensure dead leader is excluded
-        alive_ips = [ip for ip in alive_ips if ip != old_leader]
-
-        self.logger.fault(
-            f"Alive nodes after leader failure: {alive_ips}")
-
-        self.server_members = alive_ips
-        self._known_members = set(alive_ips)
-        self.election.update_ring(alive_ips)
-
+        alive = sorted(set(list(self.discovery.get_alive_servers().keys()) + [self.my_ip]))
+        alive = [ip for ip in alive if ip != old_leader]
+        self.server_members = alive
+        self._known_members = set(alive)
+        self.group_view.install_view(alive, reason=f"leader {old_leader} failed")
+        self.election.update_ring(alive)
         time.sleep(1)
         self.election.start_election(reason="leader failure")
-
-        leader = self.election.wait_for_leader(timeout=ELECTION_TIMEOUT + 2)
-        if leader:
-            self._post_election_setup()
+        if self.election.wait_for_leader(timeout=ELECTION_TIMEOUT + 2):
+            self._configure_heartbeat()
 
     def _handle_server_shutdown(self, msg):
-        """A server announced graceful shutdown."""
         from_ip = msg.get("from")
         self.logger.system(f"Server {from_ip} shutting down")
         if self.election.is_leader():
             self.server_members = [ip for ip in self.server_members if ip != from_ip]
             self.election.update_ring(self.server_members)
-            other_ips = [ip for ip in self.server_members if ip != self.my_ip]
-            self.heartbeat.update_monitored_nodes(other_ips)
+            self.heartbeat.update_monitored_nodes(
+                [ip for ip in self.server_members if ip != self.my_ip])
 
     def _get_alive_members(self):
-        """Return list of server IPs that are still alive (recently broadcasting).
-        Used by election timeout to rebuild ring with only reachable nodes."""
-        alive_servers = self.discovery.get_alive_servers()
-        alive_ips = sorted(set(list(alive_servers.keys()) + [self.my_ip]))
-        self.server_members = alive_ips
-        self._known_members = set(alive_ips)
-        return alive_ips
+        alive = sorted(set(list(self.discovery.get_alive_servers().keys()) + [self.my_ip]))
+        self.server_members = alive
+        self._known_members = set(alive)
+        return alive
 
-    def _udp_send_for_retransmit(self, target_ip, msg_dict):
-        """Callback for ReliableMulticast retransmissions."""
-        self._udp_send(target_ip, CHAT_PORT, msg_dict)
+    def _alive_peers(self):
+        """Reachable server peers for anti-entropy (excludes self + blocked peers)."""
+        return [ip for ip in self.server_members
+                if ip != self.my_ip and not self.is_blocked(ip)]
 
-    # --- Network Helpers ---
+    # --- Demo: simulated network partition ---
 
-    def _udp_send(self, target_ip, port, msg_dict):
-        """Send a JSON message via UDP (like simpleclient.py pattern)."""
+    def is_blocked(self, ip):
+        return ip in self._blocked_peers
+
+    def partition(self, ip):
+        self._blocked_peers.add(ip)
+        self.logger.fault(f"PARTITION: now dropping all traffic to/from {ip}")
+
+    def heal(self):
+        healed = sorted(self._blocked_peers)
+        self._blocked_peers.clear()
+        self.logger.system(f"HEAL: restored traffic to/from {healed}")
+
+    # --- Network helpers ---
+
+    def _udp_chat_send(self, target_ip, msg_dict):
+        if self.is_blocked(target_ip):
+            return  # simulated partition
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.sendto(json.dumps(msg_dict).encode(), (target_ip, port))
+            sock.sendto(json.dumps(msg_dict).encode(), (target_ip, CHAT_PORT))
             sock.close()
         except Exception as e:
-            self.logger.fault(f"UDP send to {target_ip}:{port} failed: {e}")
-
-    def _multicast_to_servers(self, msg_dict):
-        """Send to all servers except self via UDP."""
-        for ip in self.server_members:
-            if ip != self.my_ip:
-                self._udp_send(ip, CHAT_PORT, msg_dict)
+            self.logger.fault(f"UDP send to {target_ip}:{CHAT_PORT} failed: {e}")
 
     def _broadcast_to_servers(self, msg_dict):
-        """Send to all servers via UDP."""
         for ip in self.server_members:
             if ip != self.my_ip:
-                self._udp_send(ip, CHAT_PORT, msg_dict)
+                self._udp_chat_send(ip, msg_dict)
 
     @staticmethod
     def _tcp_send(sock, data):
-        """Send length-prefixed data over TCP."""
-        length = struct.pack("!I", len(data))
-        sock.sendall(length + data)
+        sock.sendall(struct.pack("!I", len(data)) + data)
 
     @staticmethod
     def _tcp_recv(sock):
-        """Receive length-prefixed data over TCP."""
         header = ChatServer._recv_exact(sock, 4)
         if header is None:
             return None
-        length = struct.unpack("!I", header)[0]
-        return ChatServer._recv_exact(sock, length)
+        return ChatServer._recv_exact(sock, struct.unpack("!I", header)[0])
 
     @staticmethod
     def _recv_exact(sock, n):
-        """Receive exactly n bytes."""
         data = b""
         while len(data) < n:
             chunk = sock.recv(n - len(data))
@@ -620,20 +454,36 @@ class ChatServer:
     # --- Status ---
 
     def get_status(self):
+        snap = self.delivery.snapshot()
         return {
             "ip": self.my_ip,
+            "node_id": self.node_id,
             "leader": self.election.get_leader(),
             "is_leader": self.election.is_leader(),
             "ring": self.election.ring,
             "members": self.server_members,
+            "view_id": self.group_view.get_view_id(),
+            "blocked": sorted(self._blocked_peers),
             "clients": list(self.client_names.values()),
-            "history_size": len(self.chat_history),
+            "delivered": snap["delivered"],
+            "holdback": snap["holdback"],
+            "vc": snap["vc"],
         }
+
+    def print_history(self):
+        order = self.delivery.converged_order()
+        print(f"\n\033[93m{'='*60}")
+        print(f"  CONVERGED ORDER ({len(order)} messages) — identical on every replica")
+        print(f"{'='*60}\033[0m")
+        for i, e in enumerate(order, 1):
+            print(f"  {i:3}. [LT{e['lamport_ts']:<3} {e['origin_id']}#{e['origin_counter']}] "
+                  f"{e['username']}: {e['text']}")
+        print(f"\033[93m{'='*60}\033[0m\n")
 
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Distributed Chat Server")
+    parser = argparse.ArgumentParser(description="Distributed Chat Server (AP)")
     parser.add_argument("--ip", type=str, default=None,
                         help="Server IP address (default: auto-detect)")
     parser.add_argument("--port", type=int, default=TCP_PORT,
@@ -654,25 +504,39 @@ def main():
 
     print(f"\n{'─'*60}")
     print(f"  Server running. Commands:")
-    print(f"    status  - Show server status")
-    print(f"    quit    - Shutdown server")
+    print(f"    status            - show server + causal-delivery state")
+    print(f"    history           - print the converged total order")
+    print(f"    partition <ip>    - (demo) drop all traffic to/from <ip>")
+    print(f"    heal              - (demo) restore all blocked traffic")
+    print(f"    quit              - shut down server")
     print(f"{'─'*60}\n")
 
     while True:
         try:
-            cmd = input().strip().lower()
+            parts = input().strip().split()
+            if not parts:
+                continue
+            cmd = parts[0].lower()
             if cmd == "status":
-                status = server.get_status()
-                print(f"\n{'='*40}")
-                print(f"  Server Status")
-                print(f"{'='*40}")
-                print(f"  IP:         {status['ip']}")
-                print(f"  Leader:     {status['leader']} {'(ME)' if status['is_leader'] else ''}")
-                print(f"  Ring:       {' -> '.join(status['ring'])}")
-                print(f"  Members:    {status['members']}")
-                print(f"  Clients:    {status['clients']}")
-                print(f"  History:    {status['history_size']} messages")
-                print(f"{'='*40}\n")
+                s = server.get_status()
+                print(f"\n{'='*44}")
+                print(f"  Server Status — {s['node_id']}")
+                print(f"{'='*44}")
+                print(f"  Leader:    {s['leader']} {'(ME)' if s['is_leader'] else ''}")
+                print(f"  Ring:      {' -> '.join(s['ring'])}")
+                print(f"  Members:   {s['members']}  (view #{s['view_id']})")
+                if s['blocked']:
+                    print(f"  BLOCKED:   {s['blocked']}  <-- simulated partition active")
+                print(f"  Clients:   {s['clients']}")
+                print(f"  Delivered: {s['delivered']} msgs   Held back: {s['holdback']}")
+                print(f"  VectorClk: {s['vc']}")
+                print(f"{'='*44}\n")
+            elif cmd == "history":
+                server.print_history()
+            elif cmd == "partition" and len(parts) > 1:
+                server.partition(parts[1])
+            elif cmd == "heal":
+                server.heal()
             elif cmd in ("quit", "exit", "q"):
                 server.stop()
                 break

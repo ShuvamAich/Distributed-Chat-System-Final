@@ -24,11 +24,12 @@ from common.network import get_broadcast_addresses
 class DiscoveryService:
     """UDP broadcast-based discovery for servers and clients."""
 
-    def __init__(self, node_ip, role, logger, tcp_port=None):
+    def __init__(self, node_ip, role, logger, tcp_port=None, block_filter=None):
         self.node_ip = node_ip
         self.role = role
         self.tcp_port = tcp_port
         self.logger = logger
+        self._block_filter = block_filter  # block_filter(ip) -> True to drop (demo partition)
         self.discovered_nodes = {}  # ip -> {role, tcp_port, last_seen}
         self._lock = threading.Lock()
         self._running = False
@@ -114,6 +115,10 @@ class DiscoveryService:
                     msg = json.loads(data.decode())
                     msg_type = msg.get("type")
                     sender_ip = msg.get("ip", addr[0])
+
+                    # Simulated network partition: pretend we never heard this peer.
+                    if self._block_filter and self._block_filter(sender_ip):
+                        continue
 
                     if msg_type == MSG_DISCOVERY_REQUEST and self.role == ROLE_SERVER:
                         response = json.dumps({

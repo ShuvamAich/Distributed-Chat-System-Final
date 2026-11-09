@@ -37,6 +37,8 @@ CATEGORY_COLORS = {
     "SYNC": Colors.CYAN,
     "SYSTEM": Colors.WHITE,
     "RELIABILITY": Colors.YELLOW,
+    "GOSSIP": Colors.BLUE,
+    "CAUSAL": Colors.YELLOW,
 }
 
 
@@ -95,6 +97,12 @@ class SystemLogger:
 
     def reliability(self, message, detail=None):
         self._log("RELIABILITY", message, detail)
+
+    def gossip(self, message, detail=None):
+        self._log("GOSSIP", message, detail)
+
+    def causal(self, message, detail=None):
+        self._log("CAUSAL", message, detail)
 
     def banner(self, text):
         with self._lock:

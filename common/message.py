@@ -1,52 +1,49 @@
 """
-Message protocol for the distributed chat system.
-All messages are serialized as JSON with a standard envelope.
+Chat message envelope for the AP distributed chat system.
+
+Messages travel as plain JSON dicts (matching the UDP/TCP transport used
+everywhere else). This module is the single source of truth for the envelope
+shape and for globally-unique message IDs.
+
+Envelope fields:
+    msg_id        "<ip>:<epoch>:<counter>" — globally unique, the dedup key
+    origin_id     "<ip>:<epoch>"           — the originating node incarnation
+    origin_counter int                     — == origin's own vector-clock entry
+    username      str                       — display name of the human sender
+    text          str                       — message body
+    system        bool                      — True for join/leave notices
+    vector_clock  {origin_id: int}          — causal dependencies
+    lamport_ts    int                       — scalar for the eventual total order
+    wall_time     float                     — informational only, never used for ordering
 """
 
-import json
-import time
-import uuid
+
+def make_msg_id(origin_id, counter):
+    """Build the globally-unique message id from a node incarnation + counter."""
+    return f"{origin_id}:{counter}"
 
 
-class Message:
-    """Standard message envelope for all system communication."""
+def make_envelope(origin_id, counter, username, text, vector_clock,
+                  lamport_ts, wall_time, system=False):
+    """Assemble a chat message envelope (a plain JSON-serializable dict)."""
+    return {
+        "msg_id": make_msg_id(origin_id, counter),
+        "origin_id": origin_id,
+        "origin_counter": counter,
+        "username": username,
+        "text": text,
+        "system": system,
+        "vector_clock": vector_clock,
+        "lamport_ts": lamport_ts,
+        "wall_time": wall_time,
+    }
 
-    def __init__(self, msg_type, sender_id, payload=None, msg_id=None,
-                 timestamp=None, sequence_num=None, vector_clock=None):
-        self.msg_id = msg_id or str(uuid.uuid4())[:8]
-        self.msg_type = msg_type
-        self.sender_id = sender_id
-        self.payload = payload or {}
-        self.timestamp = timestamp or time.time()
-        self.sequence_num = sequence_num
-        self.vector_clock = vector_clock or {}
 
-    def serialize(self):
-        return json.dumps({
-            "msg_id": self.msg_id,
-            "msg_type": self.msg_type,
-            "sender_id": self.sender_id,
-            "payload": self.payload,
-            "timestamp": self.timestamp,
-            "sequence_num": self.sequence_num,
-            "vector_clock": self.vector_clock,
-        }).encode("utf-8")
+def sort_key(env):
+    """Deterministic eventual-total-order key: (lamport, origin, counter).
 
-    @classmethod
-    def deserialize(cls, data):
-        if isinstance(data, bytes):
-            data = data.decode("utf-8")
-        obj = json.loads(data)
-        return cls(
-            msg_type=obj["msg_type"],
-            sender_id=obj["sender_id"],
-            payload=obj.get("payload", {}),
-            msg_id=obj.get("msg_id"),
-            timestamp=obj.get("timestamp"),
-            sequence_num=obj.get("sequence_num"),
-            vector_clock=obj.get("vector_clock", {}),
-        )
-
-    def __repr__(self):
-        return (f"Message(type={self.msg_type}, sender={self.sender_id}, "
-                f"seq={self.sequence_num}, id={self.msg_id})")
+    Lamport timestamps are consistent with causality, so a cause always has a
+    strictly smaller lamport_ts than its effect; origin_id breaks ties between
+    concurrent messages and origin_counter is a final defensive tiebreaker.
+    """
+    return (env["lamport_ts"], env["origin_id"], env["origin_counter"])

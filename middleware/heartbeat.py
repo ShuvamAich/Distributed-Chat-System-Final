@@ -20,11 +20,12 @@ from common.constants import (
 class HeartbeatService:
     """UDP-based heartbeat monitoring for crash detection."""
 
-    def __init__(self, my_ip, logger, on_node_failed, on_leader_failed):
+    def __init__(self, my_ip, logger, on_node_failed, on_leader_failed, block_filter=None):
         self.my_ip = my_ip
         self.logger = logger
         self.on_node_failed = on_node_failed
         self.on_leader_failed = on_leader_failed
+        self._block_filter = block_filter  # block_filter(ip) -> True to drop (demo partition)
         self.monitored_nodes = {}  # ip -> last_ack_time
         self.leader_ip = None
         self.last_leader_heartbeat = time.time()
@@ -74,6 +75,8 @@ class HeartbeatService:
         while self._running:
             try:
                 data, addr = sock.recvfrom(BUFFER_SIZE)
+                if self._block_filter and self._block_filter(addr[0]):
+                    continue  # simulated partition: drop heartbeat traffic from blocked peer
                 msg = json.loads(data.decode())
                 msg_type = msg.get("type")
 
@@ -116,6 +119,8 @@ class HeartbeatService:
             }).encode()
 
             for target_ip in targets:
+                if self._block_filter and self._block_filter(target_ip):
+                    continue  # simulated partition: cannot reach this node
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                     sock.sendto(heartbeat_msg, (target_ip, HEARTBEAT_PORT))

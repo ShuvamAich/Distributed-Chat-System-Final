@@ -16,11 +16,11 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def print_header():
     print("\033[96m" + "=" * 70)
-    print("   DISTRIBUTED CHAT SYSTEM - DEMO")
+    print("   DISTRIBUTED CHAT SYSTEM - DEMO  (AP: availability-first)")
     print("   Discovery: UDP Broadcast (broadcastsender/listener pattern)")
-    print("   Election: LCR Ring Algorithm (lcr-template.py pattern)")
-    print("   Communication: UDP (servers) + TCP (clients)")
-    print("   Ordering: Causal (Vector Clocks) + Total (Leader Sequencer)")
+    print("   Election:  LCR Ring Algorithm (lcr-template.py) - CONTROL PLANE ONLY")
+    print("   Messaging: peer-to-peer mesh, NO leader on the message path")
+    print("   Ordering:  Causal (vector clocks) -> eventual total order")
     print("=" * 70 + "\033[0m\n")
 
 
@@ -41,56 +41,65 @@ def show_architecture():
   │  Client A   │◄── (Discovery) ──────►│  Client B   │
   └──────┬──────┘    255.255.255.255    └──────┬──────┘
          │ TCP                                  │ TCP
-         │                                      │
   ┌──────▼──────────────────────────────────────▼──────┐
-  │                 SERVER RING (LCR)                    │
+  │              SERVER MESH (peer-to-peer)             │
   │                                                     │
   │  ┌──────────┐  UDP   ┌──────────┐  UDP   ┌──────────┐
-  │  │Server .1 │◄──────►│Server .5 │◄──────►│Server .10│
-  │  │(Follower)│        │(Follower)│        │ (LEADER) │
+  │  │ Server 1 │◄──────►│ Server 2 │◄──────►│ Server 3 │
   │  └──────────┘        └──────────┘        └──────────┘
-  │       ▲                    ▲                    ▲     │
-  │       └──── Heartbeats ────┴──── Ring Votes ────┘     │
-  └───────────────────────────────────────────────────────┘
+  │   every server accepts + shows + gossips a message   │
+  │   (the elected leader does liveness+membership ONLY, │
+  │    and is deliberately OFF the message path)         │
+  └──────────────────────────────────────────────────────┘
 
-  Discovery: UDP Broadcast (broadcastsender.py pattern)
-  Ring:      Sorted by binary IP (ring.py pattern)
-  Election:  LCR via UDP ring (lcr-template.py pattern)
-  Chat:      TCP client->server, UDP server->server
-  Ordering:  Vector clocks (lamport_clock.py extended)
+  Discovery:    UDP Broadcast (broadcastsender.py pattern)
+  Ring (votes): Sorted by binary IP (ring.py pattern), LCR (lcr-template.py)
+  Chat:         TCP client<->server, UDP server<->server mesh
+  Ordering:     Vector clocks (causal) + Lamport tiebreaker (total order)
+  Reliability:  Decentralized anti-entropy gap-fill (no central ACK/resend)
 \033[0m""")
 
 
 def show_instructions():
     print("""
-\033[93mMulti-Machine Demo (recommended):\033[0m
+\033[93mTwo-Machine Demo (recommended — both machines act as servers):\033[0m
 
-  Machine 1: python run_server.py
+  Machine 1: python run_server.py            (auto-detects its LAN IP)
   Machine 2: python run_server.py
-  Machine 3: python run_server.py
+  Machine 1: python run_client.py --username Alice
+  Machine 2: python run_client.py --username Bob
 
-  Any machine: python run_client.py --username Alice
-  Any machine: python run_client.py --username Bob
+  Both machines must be on the same LAN subnet. Servers discover each other
+  via UDP broadcast; clients discover a server automatically. Scales to any
+  number of servers/clients — nothing is hardcoded.
 
-  All machines must be on the same LAN subnet.
-  Servers discover each other automatically via UDP broadcast.
-  Clients discover servers automatically.
-
-\033[93mSingle-Machine Demo:\033[0m
+\033[93mSingle-Machine Smoke Test (one server + clients):\033[0m
 
   Terminal 1: python run_server.py --ip 127.0.0.1
-  Terminal 2: python run_server.py --ip 127.0.0.2
-  Terminal 3: python run_server.py --ip 127.0.0.3
-  Terminal 4: python run_client.py --username Alice --server 127.0.0.1
-  Terminal 5: python run_client.py --username Bob --server 127.0.0.2
+  Terminal 2: python run_client.py --username Alice --server 127.0.0.1
+  Terminal 3: python run_client.py --username Bob   --server 127.0.0.1
+  (The full multi-server mesh is best shown across two real machines, because
+   discovery and the mesh share fixed UDP ports.)
 
-\033[93mDemo Scenarios:\033[0m
+\033[93mDemo Scenarios (the four required properties):\033[0m
 
-  1. Watch server terminals for leader election (LCR ring votes)
-  2. Type messages in client terminals — observe sequence numbers
-  3. Kill the LEADER terminal — watch re-election happen
-  4. Messages continue flowing after new leader elected
-  5. Type 'status' in any server to see cluster state
+  1. DYNAMIC DISCOVERY — start the servers; 'status' on each shows both members.
+     Start clients; they connect with no addresses typed.
+  2. VOTING (LCR) — 'status' shows the same elected leader (highest IP) on both.
+  3. FAULT TOLERANCE
+     a) Kill a NON-leader server: chats keep flowing; restart it and watch
+        anti-entropy ('GOSSIP' logs) catch it back up.
+     b) Kill the LEADER: chat KEEPS FLOWING (leader is off the message path);
+        a new leader is elected in the background.
+     c) PARTITION: on each server type 'partition <other-ip>'. Both sides keep
+        chatting and each elects its own leader. Then 'heal' on both — anti-
+        entropy reconciles and 'history' converges identically on both.
+  4. ORDERING — delay a reply's cause to see causal hold-back; send concurrent
+     messages from both machines, then run 'history' on each server and confirm
+     the converged order is identical.
+
+\033[93mServer commands:\033[0m  status | history | partition <ip> | heal | quit
+\033[93mClient commands:\033[0m  /status | /history | /quit
 """)
 
 

@@ -25,10 +25,11 @@ from common.network import form_ring, get_neighbour
 class LCRElection:
     """LCR Ring-based leader election using UDP (based on lcr-template.py)."""
 
-    def __init__(self, my_ip, logger, get_alive_callback=None):
+    def __init__(self, my_ip, logger, get_alive_callback=None, block_filter=None):
         self.my_ip = my_ip
         self.logger = logger
         self._get_alive_callback = get_alive_callback
+        self._block_filter = block_filter  # block_filter(ip) -> True to drop (demo partition)
         self.ring = []
         self.neighbour = None  # left neighbour (IP, port) tuple
         self.leader_ip = None
@@ -100,6 +101,8 @@ class LCRElection:
         while self._running:
             try:
                 data, address = self._ring_socket.recvfrom(BUFFER_SIZE)
+                if self._block_filter and self._block_filter(address[0]):
+                    continue  # simulated partition: drop ring traffic from blocked peer
                 election_message = json.loads(data.decode())
                 self._handle_election_message(election_message, address)
             except socket.timeout:
@@ -221,6 +224,8 @@ class LCRElection:
         """Send a JSON message to the left neighbour via UDP."""
         if not self.neighbour:
             return
+        if self._block_filter and self._block_filter(self.neighbour):
+            return  # simulated partition: cannot reach this neighbour
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.sendto(json.dumps(message).encode(), (self.neighbour, RING_PORT))
@@ -261,7 +266,7 @@ class LCRElection:
             print(f"  ELECTION RESULT: I AM THE LEADER")
             print(f"{'='*60}")
             print(f"  Node IP:    {self.my_ip}")
-            print(f"  Role:       LEADER (Sequencer + Coordinator)")
+            print(f"  Role:       LEADER (Coordinator: liveness + membership)")
             print(f"  Ring:       {' -> '.join(self.ring)}")
             print(f"{'='*60}\033[0m\n")
         else:
